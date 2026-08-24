@@ -14,6 +14,7 @@
 
 #include "GainRamp.h"
 #include "RigConfig.h"
+#include "RoutingCheck.h"
 #include "SafetySupervisor.h"
 #include "Units.h"
 #include "WingProtocol.h"
@@ -781,6 +782,120 @@ void testSupervisorBurstAndThermal()
 }
 
 // ---------------------------------------------------------------------------
+void testRoutingCheck()
+{
+    // A rig wired exactly as configured: strong signal at both inputs, and the
+    // room level following the vocal fader.
+    auto healthy = [] {
+        RoutingMeasurements m;
+        m.silentMicDbFS = -70.0f;
+        m.silentVocalDbFS = -68.0f;
+        m.testMicDbFS = -30.0f;
+        m.testVocalDbFS = -28.0f;
+        m.faderDeltaDb = 6.0f;
+        m.raisedMicDbFS = -25.0f;      // 5 of the 6 dB shows up
+        m.readBackFaderDeltaDb = 6.0f; // and the console agrees it moved by 6
+        m.consoleAcknowledged = true;
+        return m;
+    };
+
+    test::beginTest ("RoutingCheck - a correctly wired rig passes");
+
+    auto v = evaluateRouting (healthy());
+    CHECK (v.passed);
+    CHECK (v.speechReachesRoom && v.roomReachesMic && v.loopExists && v.faderControlsLoop);
+    CHECK (v.failures.empty());
+    CHECK_CLOSE (v.observedFaderResponseDb, 5.0, 1e-3);
+
+    test::beginTest ("RoutingCheck - the wrong console channel is caught");
+
+    // The failure this whole check exists for. The fader moves, the console
+    // acknowledges, both microphones hear the speech - and the room level does
+    // not follow, because the channel being raised is not the one the microphone
+    // is on. Left undetected, the trainer raises gain, sees no feedback, and
+    // concludes the room has enormous margin.
+    auto wrongChannel = healthy();
+    wrongChannel.raisedMicDbFS = wrongChannel.testMicDbFS + 0.3f;
+    v = evaluateRouting (wrongChannel);
+    CHECK (! v.passed);
+    CHECK (! v.faderControlsLoop);
+    CHECK (v.roomReachesMic);          // everything else looked fine
+    CHECK (v.loopExists);
+    CHECK (! v.failures.empty());
+
+    test::beginTest ("RoutingCheck - a partial response is still a failure");
+
+    // Half the commanded move is the threshold, because the measurement mic also
+    // hears the speaker directly and that path does not move with the fader.
+    auto partial = healthy();
+    partial.raisedMicDbFS = partial.testMicDbFS + 2.0f;   // 2 of 6
+    CHECK (! evaluateRouting (partial).faderControlsLoop);
+
+    partial.raisedMicDbFS = partial.testMicDbFS + 3.5f;   // comfortably over half
+    CHECK (evaluateRouting (partial).faderControlsLoop);
+
+    test::beginTest ("RoutingCheck - an impossibly large response voids the test");
+
+    // More movement than the fader can account for means something else changed
+    // during the measurement. Void, not passed.
+    auto disturbed = healthy();
+    disturbed.raisedMicDbFS = disturbed.testMicDbFS + 14.0f;
+    v = evaluateRouting (disturbed);
+    CHECK (! v.passed);
+    CHECK (! v.faderControlsLoop);
+
+    test::beginTest ("RoutingCheck - dead inputs are told apart");
+
+    // Listening mic dead, vocal channel fine: the speaker is working, so the
+    // fault is on the measurement side.
+    auto deadMic = healthy();
+    deadMic.testMicDbFS = deadMic.silentMicDbFS + 1.0f;
+    deadMic.raisedMicDbFS = deadMic.testMicDbFS;
+    v = evaluateRouting (deadMic);
+    CHECK (! v.passed);
+    CHECK (! v.roomReachesMic);
+    CHECK (v.speechReachesRoom);       // the vocal channel proves the speaker works
+    CHECK (v.loopExists);
+
+    // Nothing reaching the room at all: both inputs quiet.
+    auto deadSpeaker = healthy();
+    deadSpeaker.testMicDbFS = deadSpeaker.silentMicDbFS + 1.0f;
+    deadSpeaker.raisedMicDbFS = deadSpeaker.testMicDbFS;
+    deadSpeaker.testVocalDbFS = deadSpeaker.silentVocalDbFS + 1.0f;
+    v = evaluateRouting (deadSpeaker);
+    CHECK (! v.passed);
+    CHECK (! v.speechReachesRoom);
+    CHECK (! v.loopExists);
+
+    test::beginTest ("RoutingCheck - a wrong fader encoding is caught");
+
+    // The console answers, the room responds, everything acoustic looks right -
+    // but we are reading its fader in the wrong units, so a 6 dB command reads
+    // back as a fraction of a dB. Left undetected, every gain step the ramp takes
+    // would be the wrong size.
+    auto wrongUnits = healthy();
+    wrongUnits.readBackFaderDeltaDb = 0.075f;    // normalised travel read as dB
+    v = evaluateRouting (wrongUnits);
+    CHECK (! v.passed);
+    CHECK (! v.faderEncodingConfirmed);
+    CHECK (v.faderControlsLoop);                 // the acoustics were fine
+    CHECK (! v.failures.empty());
+
+    // And a small disagreement, within the fader's own resolution, is fine.
+    auto slightlyOff = healthy();
+    slightlyOff.readBackFaderDeltaDb = 5.6f;
+    CHECK (evaluateRouting (slightlyOff).passed);
+
+    test::beginTest ("RoutingCheck - an unacknowledged console voids everything");
+
+    auto noAck = healthy();
+    noAck.consoleAcknowledged = false;
+    v = evaluateRouting (noAck);
+    CHECK (! v.passed);
+    CHECK (! v.failures.empty());
+}
+
+// ---------------------------------------------------------------------------
 int main()
 {
     testUnits();
@@ -794,5 +909,6 @@ int main()
     testSupervisorMicrophone();
     testSupervisorGovernor();
     testSupervisorBurstAndThermal();
+    testRoutingCheck();
     return test::summary();
 }

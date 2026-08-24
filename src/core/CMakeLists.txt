@@ -11,6 +11,7 @@ add_library(fbkt_core STATIC
     SafetySupervisor.cpp
     WingProtocol.cpp
     GainRamp.cpp
+    RoutingCheck.cpp
 )
 
 target_include_directories(fbkt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -1,0 +1,372 @@
+name: Build
+
+# Mirrors FBKSuppressor's shape deliberately: the two repositories are worked on
+# together and share fbk_dsp, so a failure should read the same way in both.
+#
+#   push to dev   -> pre-release, tagged vX.Y.Z-dev.<run number>
+#   push to main  -> release,     tagged vX.Y.Z
+#
+# The version comes from CMakeLists.txt, which is the single source of truth.
+on:
+  push:
+    branches: [main, dev, 'claude/**']
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+  JUCE_TAG: "8.0.15"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The safety envelope, on every platform's standard library, as a fast gate.
+  #
+  # fbkt_core depends on nothing - not JUCE, not the audio stack, not fbk_dsp - so
+  # this configures, compiles and runs the whole suite in about a minute. It gates
+  # the application builds because an application that opens a PA is worth nothing
+  # if the code deciding how loud it may get is wrong.
+  core-tests:
+    name: Core tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux / GCC
+            os: ubuntu-latest
+            cmake_extra: -DCMAKE_CXX_COMPILER=g++
+          - name: Linux / Clang
+            os: ubuntu-latest
+            cmake_extra: -DCMAKE_CXX_COMPILER=clang++
+          - name: Windows / MSVC
+            os: windows-latest
+            cmake_extra: ""
+          - name: macOS / Apple Clang
+            os: macos-latest
+            cmake_extra: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        shell: bash
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DFBKT_BUILD_APP=OFF
+          -DFBKT_BUILD_TESTS=ON
+          ${{ matrix.cmake_extra }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ -f build/tests/fbkt_tests.exe ]; then
+            ./build/tests/fbkt_tests.exe
+          else
+            ./build/tests/fbkt_tests
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Windows is the product. Linux and macOS are built anyway, as a portability
+  # check: JUCE hides most platform differences but the audio device layer is
+  # exactly where it does not, and a compile error there is cheaper to find here
+  # than on the one machine that matters.
+  build:
+    name: ${{ matrix.name }}
+    needs: core-tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            artifact: FBKTrainer-Windows
+          - name: Linux
+            os: ubuntu-latest
+            artifact: FBKTrainer-Linux
+          - name: macOS
+            os: macos-latest
+            artifact: FBKTrainer-macOS
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: FBKTrainer
+
+      # fbk_dsp comes from a sibling checkout so the simulator runs the exact code
+      # that ships. It is optional here: milestone 1 does not use the analysis
+      # stages, and a missing checkout must not stop the application building. A
+      # token is needed while FBKSuppressor is private.
+      - name: Check out FBKSuppressor for fbk_dsp
+        id: dsp
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: adrianoftyriel/FBKSuppressor
+          path: FBKSuppressor
+          token: ${{ secrets.FBKSUPPRESSOR_TOKEN || github.token }}
+
+      - name: Report whether fbk_dsp is available
+        shell: bash
+        run: |
+          if [ -f FBKSuppressor/src/dsp/CMakeLists.txt ]; then
+            echo "fbk_dsp present - analysis stages will be linked."
+          else
+            echo "::warning::FBKSuppressor was not checked out, so fbk_dsp is unavailable and the analysis stages are skipped. Set the FBKSUPPRESSOR_TOKEN secret to enable them."
+          fi
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libasound2-dev libjack-jackd2-dev \
+            libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxcursor-dev \
+            libxcomposite-dev libfreetype6-dev libfontconfig1-dev libgl1-mesa-dev \
+            libcurl4-openssl-dev
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Cache JUCE
+        uses: actions/cache@v4
+        with:
+          path: FBKTrainer/build/_deps
+          key: juce-${{ runner.os }}-${{ env.JUCE_TAG }}
+
+      - name: Configure
+        shell: bash
+        working-directory: FBKTrainer
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DFBKT_BUILD_APP=ON
+          -DFBKT_BUILD_TESTS=ON
+          -DFBKT_JUCE_TAG=${{ env.JUCE_TAG }}
+          -DFBKT_SUPPRESSOR_DIR=${{ github.workspace }}/FBKSuppressor
+
+      - name: Build
+        shell: bash
+        working-directory: FBKTrainer
+        run: cmake --build build --parallel
+
+      - name: Collect
+        shell: bash
+        working-directory: FBKTrainer
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          # juce_add_gui_app puts the binary under <target>_artefacts/<config>/.
+          found=$(find build -path '*FBKTrainer_artefacts*' \
+                    \( -name 'FBKTrainer' -o -name 'FBKTrainer.exe' -o -name 'FBKTrainer.app' \) \
+                    -print | head -1)
+          if [ -z "$found" ]; then
+            echo "::error::No FBKTrainer binary was produced"
+            find build -name 'FBKTrainer*' | head -40
+            exit 1
+          fi
+          cp -R "$found" staging/
+          ls -la staging
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: FBKTrainer/staging
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish ${{ github.ref_name == 'main' && 'release' || 'pre-release' }}
+    needs: build
+    # workflow_dispatch as well as push, as a recovery path for a run that stalls
+    # between the build jobs finishing and this one being scheduled.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Work out the version and tag
+        id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          version=$(sed -n 's/^project(FBKTrainer[[:space:]]\+VERSION[[:space:]]\+\([0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
+          if [ -z "$version" ]; then
+            echo "::error::Could not read the version from CMakeLists.txt"
+            exit 1
+          fi
+
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            tag="v${version}"
+            title="FBKTrainer ${tag}"
+            prerelease=false
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "::error::Release $tag already exists. Bump the version in CMakeLists.txt before merging to main."
+              exit 1
+            fi
+          else
+            tag="v${version}-dev.${{ github.run_number }}"
+            title="FBKTrainer ${tag} (pre-release)"
+            prerelease=true
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Package each platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          mkdir -p dist
+
+          shopt -s nullglob
+          found=0
+          for dir in artifacts/FBKTrainer-*; do
+            [ -d "$dir" ] || continue
+            platform="${dir##*/FBKTrainer-}"
+            # -y preserves symlinks, which the macOS .app bundle relies on.
+            ( cd "$dir" && zip -q -r -y "../../dist/FBKTrainer-${version}-${platform}.zip" . )
+            found=$((found + 1))
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No build artifacts were found to publish"
+            exit 1
+          fi
+
+          ( cd dist && sha256sum *.zip > SHA256SUMS.txt )
+          ls -la dist
+
+      - name: Compose release notes
+        id: notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            previous=$(gh release list --limit 100 --json tagName,isPrerelease,createdAt \
+              --jq '[.[] | select(.isPrerelease == false)] | sort_by(.createdAt) | last | .tagName // ""' || echo "")
+          else
+            previous=$(gh release list --limit 100 --json tagName,createdAt \
+              --jq 'sort_by(.createdAt) | last | .tagName // ""' || echo "")
+          fi
+
+          {
+            if [ "${{ github.ref_name }}" = "dev" ]; then
+              echo "Automated pre-release from \`dev\`. Built and tested, but not a stable release."
+              echo
+            fi
+
+            echo "Commit \`${GITHUB_SHA:0:8}\`. The safety-envelope suite passed on all four toolchains."
+            echo
+
+            echo "## What this build does"
+            echo
+            echo "Brings up a training rig and proves it is wired correctly. It does **not** yet"
+            echo "raise gain on its own or train anything - that is deliberate. This release is the"
+            echo "part that has to be right before any of the rest is safe to build:"
+            echo
+            echo "- Assign Speech Output, mixer IP, Vocal Channel and Listening Mic Input."
+            echo "- Discover the console's OSC addresses (read-only - nothing is written)."
+            echo "- Calibrate the measurement microphone against an acoustic calibrator."
+            echo "- Run the routing self test, which proves the configured vocal channel really is"
+            echo "  the channel the microphone is on."
+            echo "- Watch the live status, with the full safety envelope enforced."
+            echo
+
+            echo "## Before you run it"
+            echo
+            echo "Read \`docs/SAFETY.md\`. The short version: this program exists to drive a PA"
+            echo "towards feedback, the measurement microphone must be calibrated or no limit means"
+            echo "anything, and the training rig should not be your good boxes."
+            echo
+
+            echo "## Downloads"
+            echo
+            echo "| File | Contains |"
+            echo "|---|---|"
+            for f in dist/FBKTrainer-*-Windows.zip; do [ -e "$f" ] && echo "| \`$(basename "$f")\` | Windows application |"; done
+            for f in dist/FBKTrainer-*-macOS.zip;   do [ -e "$f" ] && echo "| \`$(basename "$f")\` | macOS application (portability build) |"; done
+            for f in dist/FBKTrainer-*-Linux.zip;   do [ -e "$f" ] && echo "| \`$(basename "$f")\` | Linux application (portability build) |"; done
+            echo "| \`SHA256SUMS.txt\` | Checksums |"
+            echo
+
+            echo "## Changes"
+            echo
+            if [ -n "$previous" ] && git rev-parse -q --verify "refs/tags/$previous" >/dev/null; then
+              echo "Since \`$previous\`:"
+              echo
+              git log --no-merges --pretty=format:'- %s' -n 60 "refs/tags/${previous}..HEAD"
+              echo
+            else
+              echo "Recent commits:"
+              echo
+              git log --no-merges --pretty=format:'- %s' -n 30
+              echo
+            fi
+          } > notes.md
+
+          cat notes.md
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          args=(--title "${{ steps.meta.outputs.title }}" --notes-file notes.md --target "${GITHUB_SHA}")
+          if [ "${{ steps.meta.outputs.prerelease }}" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${{ steps.meta.outputs.tag }}" dist/* "${args[@]}"

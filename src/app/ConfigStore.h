@@ -1,0 +1,47 @@
+// FBKTrainer - ConfigStore.h
+//
+// Reads and writes a rig to disk.
+//
+// Safety limits are written out with everything else and read back with
+// everything else, but a file that is missing them - because it was written by an
+// older build, or edited by hand - gets the defaults rather than zeros. A limit
+// that silently becomes zero is a limit that is either impossible to satisfy or
+// trivially satisfied, and which of those it is depends on which way round the
+// comparison happens to be written.
+//
+// The resolved console addresses are stored too. Discovery is a setup-time act
+// and it queries a live console; making it a startup act would mean every launch
+// probing a PA that may not be powered.
+#pragma once
+
+#include "RigConfig.h"
+#include "WingProtocol.h"
+
+#include <JuceHeader.h>
+
+namespace fbkt
+{
+struct StoredRig
+{
+    RigConfig config;
+    ResolvedAddresses addresses;
+    juce::String speechFolder;
+    float startFaderDb { -20.0f };
+
+    // Whether the routing self test has passed for this rig, and against which
+    // configuration. Cleared whenever anything that could change the wiring
+    // changes, because a pass that refers to a different configuration is worse
+    // than no pass at all.
+    bool selfTestPassed { false };
+    juce::String selfTestSignature;
+};
+
+// A short string summarising every field the routing self test depends on. If it
+// changes, a previous pass no longer applies.
+juce::String wiringSignature (const RigConfig& config);
+
+bool saveRig (const StoredRig& rig, const juce::File& file, juce::String& errorOut);
+bool loadRig (StoredRig& rigOut, const juce::File& file, juce::String& errorOut);
+
+juce::File defaultRigFile();
+} // namespace fbkt
