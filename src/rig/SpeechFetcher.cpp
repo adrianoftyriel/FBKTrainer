@@ -229,22 +229,54 @@ void SpeechFetcher::saveLibrary()
 
 void SpeechFetcher::reconcileWithDisk()
 {
+    const auto dir = cacheDirectory();
+    if (! dir.isDirectory())
+        return;
+
+    // Anything left in the staging directory is the remains of a download that
+    // was interrupted - a crash, a kill, a machine that lost power mid-run. None
+    // of it was ever validated, so none of it is worth keeping.
+    const auto staging = dir.getChildFile ("incoming");
+    if (staging.isDirectory())
+        staging.deleteRecursively();
+
     // A manifest entry whose file has gone - a cleared cache, a half-copied
     // directory - is worse than no entry, because it inflates the banked-hours
     // figure that gates an unattended run.
     juce::StringArray missing;
-    const auto dir = cacheDirectory();
+    juce::StringArray known;
 
     {
         const juce::ScopedLock sl (lock_);
         for (const auto& i : manifest_.items())
-            if (! dir.getChildFile (juce::String (i.fileName)).existsAsFile())
+        {
+            const auto name = juce::String (i.fileName);
+            known.add (name);
+            if (! dir.getChildFile (name).existsAsFile())
                 missing.add (juce::String (i.id));
+        }
     }
 
-    if (missing.isEmpty())
+    // And a file on disk that no entry claims is the mirror problem: it occupies
+    // the disk without being counted against the budget, so the cache quietly
+    // grows past its limit and nothing ever evicts it.
+    int orphansRemoved = 0;
+    for (const auto& entry : juce::RangedDirectoryIterator (dir, false, "*", juce::File::findFiles))
+    {
+        const auto file = entry.getFile();
+        const auto name = file.getFileName();
+
+        if (name == "library.xml" || known.contains (name))
+            continue;
+
+        if (file.deleteFile())
+            ++orphansRemoved;
+    }
+
+    if (missing.isEmpty() && orphansRemoved == 0)
         return;
 
+    if (! missing.isEmpty())
     {
         const juce::ScopedLock sl (lock_);
         for (const auto& id : missing)
@@ -599,7 +631,7 @@ bool SpeechFetcher::fetchOne (const Candidate& candidate)
         item.licence = candidate.licence;
         item.title = candidate.title.toStdString();
         item.pageUrl = candidate.pageUrl.toStdString();
-        item.fileName = item.id + ".audio";
+        item.fileName = item.id + extensionFromUrlPath (item.mediaUrl);
     }
 
     {
@@ -618,13 +650,26 @@ bool SpeechFetcher::fetchOne (const Candidate& candidate)
     dir.createDirectory();
 
     const auto destination = dir.getChildFile (juce::String (item.fileName));
-    const auto temporary = destination.withFileExtension (destination.getFileExtension() + ".part");
+
+    // Download into a staging directory rather than alongside the cache, and -
+    // this is the part that matters - under the file's real extension.
+    //
+    // An audio reader is chosen by extension before the file is ever opened, so
+    // a download staged as "<id>.ogg.part" matches no format and is rejected as
+    // unplayable however perfect the bytes are. Staging keeps partial files out
+    // of the cache directory without costing the extension.
+    const auto staging = dir.getChildFile ("incoming");
+    staging.createDirectory();
+    auto temporary = staging.getChildFile (destination.getFileName());
 
     setStep ("Downloading " + juce::String (item.title).substring (0, 60));
 
-    if (! download (url, temporary, policy.maxItemBytes))
+    long long downloadedBytes = 0;
+    if (! download (url, temporary, policy.maxItemBytes, downloadedBytes))
     {
         temporary.deleteFile();
+        setError ("Download failed after " + juce::File::descriptionOfSizeInBytes (downloadedBytes)
+                  + ": " + juce::String (item.title));
         const juce::ScopedLock sl (statusLock_);
         ++status_.rejectedThisSession;
         return false;
@@ -633,18 +678,48 @@ bool SpeechFetcher::fetchOne (const Candidate& candidate)
     // Prove it decodes before it is allowed anywhere near a playlist, and take
     // the duration from the decoded stream rather than from what the metadata
     // claimed.
-    const double seconds = validateAndMeasure (temporary);
+    double seconds = validateAndMeasure (temporary);
+
+    // A name that does not match the contents is a real case for feed
+    // enclosures, whose URLs often carry no extension at all. Since the reader
+    // is picked by name, the only way to tell a mislabelled file from a broken
+    // one is to try the other names.
     if (seconds <= 1.0)
     {
+        for (const auto& ext : decodableExtensionCandidates())
+        {
+            if (threadShouldExit())
+                break;
+
+            const auto renamed = temporary.getParentDirectory()
+                                     .getChildFile (temporary.getFileNameWithoutExtension()
+                                                    + juce::String (ext));
+            if (renamed == temporary || ! temporary.moveFileTo (renamed))
+                continue;
+
+            temporary = renamed;
+            seconds = validateAndMeasure (temporary);
+            if (seconds > 1.0)
+            {
+                item.fileName = renamed.getFileName().toStdString();
+                break;
+            }
+        }
+    }
+
+    if (seconds <= 1.0)
+    {
+        setError ("Downloaded " + juce::File::descriptionOfSizeInBytes (downloadedBytes)
+                  + " but it would not decode as audio: " + juce::String (item.title));
         temporary.deleteFile();
-        setError ("Discarded a file that would not decode: " + juce::String (item.title));
         const juce::ScopedLock sl (statusLock_);
         ++status_.rejectedThisSession;
         return false;
     }
 
-    destination.deleteFile();
-    if (! temporary.moveFileTo (destination))
+    const auto finalDestination = dir.getChildFile (juce::String (item.fileName));
+    finalDestination.deleteFile();
+    if (! temporary.moveFileTo (finalDestination))
     {
         temporary.deleteFile();
         setError ("Could not move a downloaded file into the cache.");
@@ -652,7 +727,7 @@ bool SpeechFetcher::fetchOne (const Candidate& candidate)
     }
 
     item.seconds = seconds;
-    item.bytes = destination.getSize();
+    item.bytes = finalDestination.getSize();
     item.fetchedAtUnix = juce::Time::getCurrentTime().toMilliseconds() / 1000;
 
     {
@@ -669,8 +744,10 @@ bool SpeechFetcher::fetchOne (const Candidate& candidate)
 }
 
 bool SpeechFetcher::download (const juce::String& url, const juce::File& destination,
-                              long long maxBytes)
+                              long long maxBytes, long long& bytesOut)
 {
+    bytesOut = 0;
+
     auto stream = openUrl (url);
     if (stream == nullptr)
         return false;
@@ -693,6 +770,8 @@ bool SpeechFetcher::download (const juce::String& url, const juce::File& destina
             break;
 
         total += read;
+        bytesOut = total;
+
         // A server that keeps sending is not permitted to fill the disk.
         if (total > maxBytes)
             return false;

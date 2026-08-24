@@ -1035,6 +1035,28 @@ void testSpeechCatalogue()
     CHECK (safeExtensionFor ("a.o g") == ".audio");
     CHECK (safeExtensionFor ("") == ".audio");
 
+    test::beginTest ("SpeechCatalogue - extensions from URLs with query strings");
+
+    // A file's reader is chosen by its extension before the file is opened, so a
+    // correct download under the wrong name is indistinguishable from a corrupt
+    // one. Podcast enclosures almost always carry tracking parameters.
+    CHECK (extensionFromUrlPath ("https://a/b/ep12.mp3") == ".mp3");
+    CHECK (extensionFromUrlPath ("https://a/b/ep12.mp3?token=abc123") == ".mp3");
+    CHECK (extensionFromUrlPath ("https://a/b/ep12.MP3#t=30") == ".mp3");
+    CHECK (extensionFromUrlPath ("https://a/b/chapter.ogg?x=1&y=2") == ".ogg");
+
+    // No extension at all, and the dot that is only in the query.
+    CHECK (extensionFromUrlPath ("https://a/b/episode?v=1.2") == ".audio");
+    CHECK (extensionFromUrlPath ("https://a/b/episode") == ".audio");
+    CHECK (extensionFromUrlPath ("https://cdn.example.com/stream") == ".audio");
+
+    // A dot in a directory name must not be mistaken for the file's extension.
+    CHECK (extensionFromUrlPath ("https://a/v1.2/episode") == ".audio");
+
+    CHECK (! decodableExtensionCandidates().empty());
+    for (const auto& ext : decodableExtensionCandidates())
+        CHECK (ext.size() >= 4 && ext[0] == '.');
+
     CHECK (archiveDownloadUrl ("", "x.ogg").empty());
     CHECK (archiveDownloadUrl ("b", "").empty());
 

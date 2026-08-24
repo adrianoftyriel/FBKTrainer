@@ -175,6 +175,24 @@ std::string archiveDownloadUrl (const std::string& identifier, const std::string
 // and anything else becomes a harmless default.
 std::string safeExtensionFor (const std::string& remoteFileName);
 
+// The extension implied by a URL's path, ignoring the query and fragment.
+//
+// Podcast enclosures routinely carry tracking parameters - ".../ep12.mp3?t=abc"
+// - and taking everything after the last dot of the whole URL yields ".mp3?t=abc"
+// or, worse, the extension of a query value. Since a file's extension is what
+// decides whether it can be decoded at all, getting this wrong means every
+// fetched file is discarded as unplayable.
+std::string extensionFromUrlPath (const std::string& url);
+
+// Extensions worth trying when a file's real format is not known from its name -
+// a feed enclosure with no extension, or one whose extension is a lie. Ordered
+// by how likely they are for spoken-word audio on the open web.
+//
+// This exists because an audio file is identified by its extension before it is
+// opened: the reader is chosen by name, not by content, so a correct file with
+// the wrong name is indistinguishable from a corrupt one.
+const std::vector<std::string>& decodableExtensionCandidates();
+
 // The Archive reports a file's duration as either plain seconds ("1234.56") or
 // a clock string ("20:34", "1:20:34"). Returns 0 for anything unparseable
 // rather than guessing - a wrong duration would corrupt the buffered-hours

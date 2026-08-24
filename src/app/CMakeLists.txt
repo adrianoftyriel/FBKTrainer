@@ -88,3 +88,35 @@ if(FBKT_HAVE_DSP)
     target_link_libraries(FBKTrainer PRIVATE fbk_dsp)
     target_compile_definitions(FBKTrainer PRIVATE FBKT_HAVE_DSP=1)
 endif()
+
+# ---------------------------------------------------------------------------
+# Format tests. Small, and separate from fbkt_tests because they need JUCE's
+# audio format registry and the core suite is deliberately free of JUCE.
+#
+# They exist because of a shipped bug: an audio file is identified by its name,
+# not its contents, so a correct download staged under a ".part" suffix matched
+# no format and was rejected as undecodable. Running on all three platforms also
+# makes them a check on which codecs each platform actually provides.
+if(FBKT_BUILD_TESTS)
+    juce_add_console_app(fbkt_format_tests PRODUCT_NAME "fbkt_format_tests")
+    juce_generate_juce_header(fbkt_format_tests)
+
+    target_sources(fbkt_format_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/FormatTests.cpp)
+
+    target_compile_definitions(fbkt_format_tests PUBLIC
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+        JUCE_DISPLAY_SPLASH_SCREEN=0
+        JUCE_REPORT_APP_USAGE=0
+        JUCE_STANDALONE_APPLICATION=1)
+
+    target_link_libraries(fbkt_format_tests PRIVATE
+        fbkt_core
+        juce::juce_audio_formats
+        PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_warning_flags)
+
+    add_test(NAME formats COMMAND fbkt_format_tests)
+endif()

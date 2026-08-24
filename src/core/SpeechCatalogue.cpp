@@ -261,6 +261,30 @@ std::string safeExtensionFor (const std::string& remoteFileName)
     return "." + ext;
 }
 
+std::string extensionFromUrlPath (const std::string& url)
+{
+    // Trim the query and the fragment before looking for an extension: the dot
+    // in "?v=1.2" is not a file extension, and treating it as one produces a
+    // name no audio reader will ever match.
+    auto path = url;
+    const auto cut = path.find_first_of ("?#");
+    if (cut != std::string::npos)
+        path = path.substr (0, cut);
+
+    // And only look at the last path segment.
+    const auto slash = path.find_last_of ('/');
+    if (slash != std::string::npos)
+        path = path.substr (slash + 1);
+
+    return safeExtensionFor (path);
+}
+
+const std::vector<std::string>& decodableExtensionCandidates()
+{
+    static const std::vector<std::string> candidates { ".mp3", ".ogg", ".m4a", ".flac", ".wav", ".aiff" };
+    return candidates;
+}
+
 std::string archiveDownloadUrl (const std::string& identifier, const std::string& fileName)
 {
     if (identifier.empty() || fileName.empty())

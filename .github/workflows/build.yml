@@ -182,6 +182,22 @@ jobs:
         working-directory: FBKTrainer
         run: cmake --build build --parallel
 
+      # An audio file is identified by its name, not its contents, and which
+      # extensions are decodable differs per platform - Media Foundation on
+      # Windows, CoreAudio on macOS, neither on Linux. Running this here is what
+      # makes that difference visible rather than a surprise at first use.
+      - name: Run format tests
+        shell: bash
+        working-directory: FBKTrainer
+        run: |
+          set -euo pipefail
+          bin=$(find build -name 'fbkt_format_tests' -o -name 'fbkt_format_tests.exe' | head -1)
+          if [ -z "$bin" ]; then
+            echo "::error::fbkt_format_tests was not built"
+            exit 1
+          fi
+          "$bin"
+
       - name: Collect
         shell: bash
         working-directory: FBKTrainer

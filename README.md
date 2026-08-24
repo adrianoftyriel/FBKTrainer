@@ -62,8 +62,11 @@ The rules it enforces:
 | **The cap outranks everything** | No measurement and no algorithm can raise gain past the configured ceiling. The search is the part of the program meant to change itself; a bug in it must not be expressible as a fader at +40. |
 | **Dead-man's switch** | An independent watchdog thread asks only whether the supervisor has been ticked. `tick()` can only notice a stall once it resumes, which is already too late. |
 
-1106 checks cover this and the speech library, on four toolchains, with no audio
-hardware, no console and no network.
+1121 checks cover this and the speech library, on four toolchains, with no audio
+hardware, no console and no network. A separate small suite (`fbkt_format_tests`)
+links JUCE's audio format registry and runs on all three platforms, because which
+codecs exist differs per platform and an audio file is identified by its name
+rather than its contents.
 
 ---
 

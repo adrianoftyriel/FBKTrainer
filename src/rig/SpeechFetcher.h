@@ -121,7 +121,8 @@ private:
     bool resolveArchiveItem (const Candidate&, SpeechItem& itemOut, juce::String& urlOut);
 
     bool fetchOne (const Candidate&);
-    bool download (const juce::String& url, const juce::File& destination, long long maxBytes);
+    bool download (const juce::String& url, const juce::File& destination,
+                   long long maxBytes, long long& bytesOut);
 
     // Opens the file and returns its real duration, or 0 if it will not decode.
     double validateAndMeasure (const juce::File&);
