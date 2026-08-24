@@ -12,6 +12,7 @@ add_library(fbkt_core STATIC
     WingProtocol.cpp
     GainRamp.cpp
     RoutingCheck.cpp
+    SpeechCatalogue.cpp
 )
 
 target_include_directories(fbkt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

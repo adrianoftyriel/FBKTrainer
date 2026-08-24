@@ -77,9 +77,18 @@ public:
     juce::AudioDeviceManager& deviceManager() noexcept { return deviceManager_; }
 
     // --- output ------------------------------------------------------------
+    // The playlist the rig works through. Set either from a folder on this
+    // machine or from the fetched cache; the engine does not care which, and
+    // deliberately knows nothing about where a file came from.
+    void setSpeechPlaylist (const juce::Array<juce::File>& files);
     void setSpeechFolder (const juce::File& folder);
     int  speechFileCount() const;
     juce::String currentSpeechFile() const;
+
+    // Full path of the file currently playing, for the library to record a play
+    // against. Polled rather than pushed: the file changes on the audio thread,
+    // and a callback from there into the library's lock is not worth the risk.
+    juce::File currentSpeechPath() const;
 
     void setSpeechPlaying (bool shouldPlay);
     bool isSpeechPlaying() const noexcept { return speechPlaying_.load(); }
@@ -127,6 +136,7 @@ private:
     std::unique_ptr<juce::ResamplingAudioSource>   speechResampler_;
     juce::AudioBuffer<float> speechScratch_;
     juce::String currentSpeechName_;
+    juce::File   currentSpeechPath_;
 
     std::atomic<bool>  speechPlaying_ { false };
     std::atomic<float> speechLevelDb_ { -24.0f };

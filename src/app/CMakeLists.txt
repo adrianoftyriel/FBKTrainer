@@ -20,6 +20,14 @@ juce_add_gui_app(FBKTrainer
     BUNDLE_ID       "org.canops.fbktrainer"
     MICROPHONE_PERMISSION_ENABLED TRUE
     MICROPHONE_PERMISSION_TEXT "FBKTrainer needs microphone access to measure the room."
+
+    # The rig fetches its own speech corpus over HTTPS. Windows goes through
+    # WinINet and macOS through NSURLSession, but on Linux JUCE needs libcurl -
+    # without it juce::URL cannot open an https stream at all, and the fetcher
+    # would fail on the portability build for a reason that looks like a network
+    # fault. NEEDS_CURL both sets the flag and links the library; defining
+    # JUCE_USE_CURL by hand sets the flag twice with two different values.
+    NEEDS_CURL TRUE
 )
 
 juce_generate_juce_header(FBKTrainer)
@@ -33,6 +41,7 @@ target_sources(FBKTrainer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../rig/AudioEngine.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../rig/RoutingSelfTest.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../rig/RunController.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../rig/SpeechFetcher.cpp
 )
 
 target_include_directories(FBKTrainer PRIVATE
@@ -42,7 +51,6 @@ target_include_directories(FBKTrainer PRIVATE
 
 target_compile_definitions(FBKTrainer PUBLIC
     JUCE_WEB_BROWSER=0
-    JUCE_USE_CURL=0
     JUCE_DISPLAY_SPLASH_SCREEN=0
     JUCE_REPORT_APP_USAGE=0
     JUCE_STRICT_REFCOUNTEDPOINTER=1

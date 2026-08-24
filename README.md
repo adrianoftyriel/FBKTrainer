@@ -25,6 +25,7 @@ What works now:
 
 - Assign the four things the rig needs: **Speech Output**, **mixer IP**,
   **Vocal Channel**, **Listening Mic Input** (plus a vocal return, recommended).
+- **Fetch its own speech corpus** from LibriVox, continuously and unattended.
 - Discover the console's OSC addresses. Read-only — nothing is written, so no
   fader moves.
 - Calibrate the measurement microphone against an acoustic calibrator.
@@ -61,9 +62,68 @@ The rules it enforces:
 | **The cap outranks everything** | No measurement and no algorithm can raise gain past the configured ceiling. The search is the part of the program meant to change itself; a bug in it must not be expressible as a fader at +40. |
 | **Dead-man's switch** | An independent watchdog thread asks only whether the supervisor has been ticked. `tick()` can only notice a stall once it resumes, which is already too late. |
 
-1005 checks cover this, on four toolchains, with no audio hardware and no console.
+1106 checks cover this and the speech library, on four toolchains, with no audio
+hardware, no console and no network.
 
 ---
+
+## Where the speech comes from
+
+The rig fetches its own material. There is no folder to fill.
+
+The built-in source is **LibriVox**, via the Internet Archive: recordings of
+public-domain texts, released by their readers to the public domain, tens of
+thousands of hours across thousands of voices, no account and no API key. The
+fetcher keeps a local cache topped up in the background and evicts
+least-recently-played material when the disk budget is reached.
+
+Four things about it are deliberate.
+
+**Provenance is recorded at the moment of arrival.** Every file carries its
+source, its licence, the page a human can check it on, and when it was fetched.
+That question — *what was this model trained on?* — is cheap to answer if the
+answer was written down as it happened and impossible to reconstruct later from a
+directory of audio.
+
+**Unknown-licence material is cached but not played, by default.** You can add a
+podcast or news RSS feed, and it will be fetched and catalogued — but with
+*Open-licensed material only* on, it never reaches the playlist and never counts
+towards the banked hours. Fetching a podcast for a local experiment is
+reasonable; letting it into the corpus behind a model you intend to distribute is
+not, and that difference shouldn't depend on anyone remembering.
+
+**The audio path never waits for the network.** Downloads happen on their own
+thread into a cache; the player only ever sees files already on disk that have
+already been proved to decode. A network that disappears halfway through a
+three-day run is a fetcher that stops making progress, not a run that stops.
+That's also why an unattended run is gated on *hours banked* rather than on the
+network being up when you press the button.
+
+**Nothing is trusted because a server said so.** Every file is opened with an
+audio reader before it enters the library, and its duration is taken from the
+decoded stream rather than from the metadata that described it. A truncated
+download, an error page served as audio, or a format this platform can't decode
+all fail identically — discarded, never played. It also means the banked-hours
+figure is measured rather than claimed, which matters because that figure gates
+an unattended run.
+
+### What it does not cover
+
+LibriVox is **read speech**. It does not contain the material that most often
+causes a false detection: sustained vowels, and sung notes with vibrato. That is
+exactly the case that produced nine confirmed "feedback" tones in FBKSuppressor's
+own testing, and no public speech corpus supplies it.
+
+So the local folder still exists, as *additional* material rather than an
+alternative. Record your own hard negatives — a held note, a soprano, sibilance,
+long pauses — and point the Speech panel at them. The auto-fetched corpus gives
+breadth; that folder gives the cases that break things.
+
+One more honest limitation: LibriVox is amateur recording, mostly MP3, and
+bounded by whatever the reader uploaded. The fetcher prefers FLAC and Ogg
+derivatives where an item has them, but the source material is what it is. For
+excitation that's acceptable — feedback modes sit where speech has energy — but
+it is not a clean full-bandwidth corpus.
 
 ## Why the routing self test exists
 
@@ -149,9 +209,12 @@ Read [`docs/SAFETY.md`](docs/SAFETY.md) first. Then, in order:
    add noise to the data, it adds a slow lie.
 2. **Console** — enter the mixer IP and the vocal channel, connect, and run
    discovery.
-3. **Check** — calibrate the measurement microphone, then run the routing self
+3. **Speech** — press *Start fetching* and leave it. It runs in the background
+   and the Run panel will tell you when enough is banked.
+4. **Check** — calibrate the measurement microphone, then run the routing self
    test.
-4. **Run** — the button stays greyed out until all of the above have passed.
+5. **Run** — the button stays greyed out until all of the above have passed,
+   including the banked-hours threshold.
 
 ---
 

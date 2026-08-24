@@ -106,7 +106,26 @@ bool saveRig (const StoredRig& rig, const juce::File& file, juce::String& errorO
     root.setAttribute ("sampleRate", c.sampleRate);
     root.setAttribute ("audioDeviceName", juce::String (c.audioDeviceName));
     root.setAttribute ("speechFolder", rig.speechFolder);
+    root.setAttribute ("speechCacheFolder", rig.speechCacheFolder);
     root.setAttribute ("startFaderDb", rig.startFaderDb);
+
+    auto* speech = root.createNewChildElement ("speech");
+    speech->setAttribute ("maxBytes", juce::String (rig.speechPolicy.maxBytes));
+    speech->setAttribute ("minBufferedSecondsForUnattended", rig.speechPolicy.minBufferedSecondsForUnattended);
+    speech->setAttribute ("targetBufferedSeconds", rig.speechPolicy.targetBufferedSeconds);
+    speech->setAttribute ("requireOpenLicence", rig.speechPolicy.requireOpenLicence);
+    speech->setAttribute ("minItemBytes", juce::String (rig.speechPolicy.minItemBytes));
+    speech->setAttribute ("maxItemBytes", juce::String (rig.speechPolicy.maxItemBytes));
+
+    for (const auto& src : rig.speechSources)
+    {
+        auto* e = speech->createNewChildElement ("source");
+        e->setAttribute ("enabled", src.enabled);
+        e->setAttribute ("kind", static_cast<int> (src.kind));
+        e->setAttribute ("name", src.name);
+        e->setAttribute ("feedUrl", src.feedUrl);
+        e->setAttribute ("licence", static_cast<int> (src.licence));
+    }
 
     auto* cal = root.createNewChildElement ("micCalibration");
     cal->setAttribute ("valid", c.micCalibration.valid);
@@ -173,7 +192,41 @@ bool loadRig (StoredRig& rigOut, const juce::File& file, juce::String& errorOut)
     c.sampleRate = root->getDoubleAttribute ("sampleRate", 48000.0);
     c.audioDeviceName = root->getStringAttribute ("audioDeviceName").toStdString();
     rig.speechFolder = root->getStringAttribute ("speechFolder");
+    rig.speechCacheFolder = root->getStringAttribute ("speechCacheFolder");
     rig.startFaderDb = static_cast<float> (root->getDoubleAttribute ("startFaderDb", -20.0));
+
+    if (const auto* speech = root->getChildByName ("speech"))
+    {
+        const CachePolicy d;
+        rig.speechPolicy.maxBytes = speech->getStringAttribute ("maxBytes", juce::String (d.maxBytes)).getLargeIntValue();
+        rig.speechPolicy.minBufferedSecondsForUnattended =
+            speech->getDoubleAttribute ("minBufferedSecondsForUnattended", d.minBufferedSecondsForUnattended);
+        rig.speechPolicy.targetBufferedSeconds =
+            speech->getDoubleAttribute ("targetBufferedSeconds", d.targetBufferedSeconds);
+        // Defaults to true when the attribute is absent, so a file written by an
+        // older build does not quietly let unknown-licence material into the
+        // corpus behind a model somebody intends to distribute.
+        rig.speechPolicy.requireOpenLicence = speech->getBoolAttribute ("requireOpenLicence", true);
+        rig.speechPolicy.minItemBytes = speech->getStringAttribute ("minItemBytes", juce::String (d.minItemBytes)).getLargeIntValue();
+        rig.speechPolicy.maxItemBytes = speech->getStringAttribute ("maxItemBytes", juce::String (d.maxItemBytes)).getLargeIntValue();
+
+        for (auto* e : speech->getChildWithTagNameIterator ("source"))
+        {
+            SpeechSource src;
+            src.enabled = e->getBoolAttribute ("enabled", true);
+            src.kind = static_cast<SpeechSourceKind> (e->getIntAttribute ("kind", 0));
+            src.name = e->getStringAttribute ("name");
+            src.feedUrl = e->getStringAttribute ("feedUrl");
+            src.licence = static_cast<LicenceClass> (e->getIntAttribute ("licence", 2));
+            rig.speechSources.add (src);
+        }
+    }
+
+    if (rig.speechSources.isEmpty())
+        rig.speechSources = defaultSpeechSources();
+
+    if (rig.speechCacheFolder.isEmpty())
+        rig.speechCacheFolder = defaultSpeechCacheFolder().getFullPathName();
 
     if (const auto* cal = root->getChildByName ("micCalibration"))
     {
@@ -219,5 +272,27 @@ juce::File defaultRigFile()
     return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
         .getChildFile ("FBKTrainer")
         .getChildFile ("rig.xml");
+}
+
+juce::File defaultSpeechCacheFolder()
+{
+    // Not next to the rig file: this grows to gigabytes, and the roaming
+    // application data directory is the wrong place for that on Windows.
+    return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+        .getChildFile ("FBKTrainer")
+        .getChildFile ("speech-cache");
+}
+
+juce::Array<SpeechSource> defaultSpeechSources()
+{
+    SpeechSource librivox;
+    librivox.enabled = true;
+    librivox.kind = SpeechSourceKind::librivox;
+    librivox.name = "LibriVox (public domain)";
+    librivox.licence = LicenceClass::publicDomain;
+
+    juce::Array<SpeechSource> sources;
+    sources.add (librivox);
+    return sources;
 }
 } // namespace fbkt

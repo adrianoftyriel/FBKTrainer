@@ -13,6 +13,7 @@
 #include "AudioEngine.h"
 #include "ConfigStore.h"
 #include "RoutingSelfTest.h"
+#include "SpeechFetcher.h"
 #include "RunController.h"
 #include "WingConsole.h"
 
@@ -22,6 +23,7 @@ namespace fbkt
 {
 class RigPanel;
 class ConsolePanel;
+class SpeechPanel;
 class CheckPanel;
 class RunPanel;
 
@@ -33,12 +35,18 @@ struct AppState
     WingConsole console;
     std::unique_ptr<RoutingSelfTest> selfTest;
     std::unique_ptr<RunController> run;
+    SpeechFetcher speech;
 
     juce::File rigFile { defaultRigFile() };
 
     void save();
     // Anything that changes the wiring invalidates a previous self-test pass.
     void wiringChanged();
+
+    // Rebuilds the engine's playlist from the fetched cache plus any local
+    // folder, and pushes it to the audio engine.
+    void refreshPlaylist();
+    void applySpeechSettings();
 
     std::function<void()> onChanged;
 };

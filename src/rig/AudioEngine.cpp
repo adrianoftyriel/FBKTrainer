@@ -153,6 +153,18 @@ void AudioEngine::prepareHighpass (double sr)
 }
 
 // ---------------------------------------------------------------------------
+void AudioEngine::setSpeechPlaylist (const juce::Array<juce::File>& files)
+{
+    const juce::ScopedLock lock (speechLock_);
+    speechFiles_ = files;
+    speechIndex_ = 0;
+    // Do not tear down whatever is currently playing: a playlist refresh happens
+    // every time the fetcher lands a new file, and dropping the current source
+    // for that would put a gap in the speech every few minutes.
+    if (speechResampler_ == nullptr)
+        speechFileEnded_.store (true);
+}
+
 void AudioEngine::setSpeechFolder (const juce::File& folder)
 {
     juce::Array<juce::File> found;
@@ -162,13 +174,7 @@ void AudioEngine::setSpeechFolder (const juce::File& folder)
             found.add (entry.getFile());
     }
     found.sort();
-
-    const juce::ScopedLock lock (speechLock_);
-    speechFiles_ = found;
-    speechIndex_ = 0;
-    speechResampler_.reset();
-    speechSource_.reset();
-    currentSpeechName_ = {};
+    setSpeechPlaylist (found);
 }
 
 int AudioEngine::speechFileCount() const
@@ -181,6 +187,12 @@ juce::String AudioEngine::currentSpeechFile() const
 {
     const juce::ScopedLock lock (speechLock_);
     return currentSpeechName_;
+}
+
+juce::File AudioEngine::currentSpeechPath() const
+{
+    const juce::ScopedLock lock (speechLock_);
+    return currentSpeechPath_;
 }
 
 void AudioEngine::setSpeechPlaying (bool shouldPlay)
@@ -203,6 +215,7 @@ void AudioEngine::advanceSpeechFile()
         speechResampler_.reset();
         speechSource_.reset();
         currentSpeechName_ = {};
+        currentSpeechPath_ = juce::File();
         return;
     }
 
@@ -222,10 +235,15 @@ void AudioEngine::advanceSpeechFile()
         speechResampler_->setResamplingRatio (ratio);
         speechResampler_->prepareToPlay (512, sampleRate_.load());
         currentSpeechName_ = file.getFileName();
+        currentSpeechPath_ = file;
     }
     else
     {
+        // Every fetched file was decoded once before it entered the library, so
+        // this means it has been removed or damaged since. Skipping is correct;
+        // the library reconciles itself with the disk separately.
         currentSpeechName_ = "(could not read " + file.getFileName() + ")";
+        currentSpeechPath_ = juce::File();
     }
 }
 

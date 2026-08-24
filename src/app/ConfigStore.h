@@ -15,6 +15,7 @@
 #pragma once
 
 #include "RigConfig.h"
+#include "SpeechFetcher.h"
 #include "WingProtocol.h"
 
 #include <JuceHeader.h>
@@ -25,7 +26,15 @@ struct StoredRig
 {
     RigConfig config;
     ResolvedAddresses addresses;
+
+    // Speech material. The folder is optional and additional: the rig fetches its
+    // own corpus, and a local folder is for the material no public corpus
+    // contains - sung notes, sustained vowels, your own difficult voice.
     juce::String speechFolder;
+    juce::String speechCacheFolder;
+    CachePolicy  speechPolicy;
+    juce::Array<SpeechSource> speechSources;
+
     float startFaderDb { -20.0f };
 
     // Whether the routing self test has passed for this rig, and against which
@@ -44,4 +53,9 @@ bool saveRig (const StoredRig& rig, const juce::File& file, juce::String& errorO
 bool loadRig (StoredRig& rigOut, const juce::File& file, juce::String& errorOut);
 
 juce::File defaultRigFile();
+juce::File defaultSpeechCacheFolder();
+
+// The sources a rig starts with: LibriVox, and nothing else. Public domain, tens
+// of thousands of hours, thousands of readers, and no account needed.
+juce::Array<SpeechSource> defaultSpeechSources();
 } // namespace fbkt

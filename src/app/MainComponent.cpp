@@ -44,6 +44,33 @@ void AppState::save()
     saveRig (rig, rigFile, error);
 }
 
+void AppState::applySpeechSettings()
+{
+    speech.setCacheDirectory (juce::File (rig.speechCacheFolder));
+    speech.setPolicy (rig.speechPolicy);
+    speech.setSources (rig.speechSources);
+}
+
+void AppState::refreshPlaylist()
+{
+    // Fetched material first, then anything in the local folder. The local
+    // folder is additional rather than alternative: it is where the material no
+    // public corpus contains goes - sung notes, sustained vowels, the difficult
+    // voice this rig actually has to cope with.
+    auto files = speech.playlist();
+
+    if (rig.speechFolder.isNotEmpty())
+    {
+        const juce::File folder (rig.speechFolder);
+        if (folder.isDirectory())
+            for (const auto& entry : juce::RangedDirectoryIterator (
+                     folder, true, "*.wav;*.flac;*.aiff;*.aif;*.mp3;*.ogg"))
+                files.add (entry.getFile());
+    }
+
+    audio.setSpeechPlaylist (files);
+}
+
 void AppState::wiringChanged()
 {
     // A self-test pass refers to one specific wiring. Anything that could change
@@ -101,13 +128,6 @@ public:
             state_.wiringChanged();
         };
 
-        styleLabel (speechFolderLabel_, "Speech material");
-        addAndMakeVisible (speechFolderLabel_);
-        addAndMakeVisible (speechFolderButton_);
-        speechFolderButton_.setButtonText (state_.rig.speechFolder.isEmpty() ? "Choose folder..."
-                                                                             : state_.rig.speechFolder);
-        speechFolderButton_.onClick = [this] { chooseSpeechFolder(); };
-
         addAndMakeVisible (applyButton_);
         applyButton_.setButtonText ("Open audio device");
         applyButton_.onClick = [this] { openDevice(); };
@@ -135,7 +155,6 @@ public:
         row (speechLabel_, speechBox_);
         row (micLabel_, micBox_);
         row (returnLabel_, returnBox_);
-        row (speechFolderLabel_, speechFolderButton_);
 
         applyButton_.setBounds (area.removeFromTop (30).removeFromLeft (200));
         area.removeFromTop (8);
@@ -146,25 +165,6 @@ public:
     }
 
 private:
-    void chooseSpeechFolder()
-    {
-        chooser_ = std::make_unique<juce::FileChooser> ("Folder of speech recordings");
-        chooser_->launchAsync (juce::FileBrowserComponent::openMode
-                                   | juce::FileBrowserComponent::canSelectDirectories,
-                               [this] (const juce::FileChooser& fc)
-                               {
-                                   const auto folder = fc.getResult();
-                                   if (! folder.isDirectory())
-                                       return;
-
-                                   state_.rig.speechFolder = folder.getFullPathName();
-                                   state_.audio.setSpeechFolder (folder);
-                                   speechFolderButton_.setButtonText (state_.rig.speechFolder);
-                                   state_.save();
-                                   refresh();
-                               });
-    }
-
     void openDevice()
     {
         auto* device = state_.audio.deviceManager().getCurrentAudioDevice();
@@ -192,7 +192,7 @@ private:
         if (state_.audio.isRunning())
             lines.add ("Sample rate: " + juce::String (state_.audio.sampleRate(), 0) + " Hz");
 
-        lines.add ("Speech files found: " + juce::String (state_.audio.speechFileCount()));
+        lines.add ("Speech in the playlist: " + juce::String (state_.audio.speechFileCount()));
         lines.add ("");
         lines.add (issueText (validate (state_.rig.config)));
 
@@ -229,12 +229,11 @@ private:
     AppState& state_;
     juce::AudioDeviceSelectorComponent deviceSelector_ { state_.audio.deviceManager(), 1, 64, 1, 64, false, false, false, false };
 
-    juce::Label nameLabel_, speechLabel_, micLabel_, returnLabel_, speechFolderLabel_;
+    juce::Label nameLabel_, speechLabel_, micLabel_, returnLabel_;
     juce::TextEditor nameEditor_;
     juce::ComboBox speechBox_, micBox_, returnBox_;
-    juce::TextButton speechFolderButton_, applyButton_;
+    juce::TextButton applyButton_;
     juce::TextEditor statusBox_;
-    std::unique_ptr<juce::FileChooser> chooser_;
 };
 
 // ===========================================================================
@@ -375,6 +374,299 @@ private:
     juce::TextEditor ipEditor_, portEditor_, channelEditor_;
     juce::TextButton connectButton_, discoverButton_;
     juce::TextEditor logBox_;
+};
+
+
+// ===========================================================================
+class SpeechPanel final : public juce::Component, private juce::Timer
+{
+public:
+    explicit SpeechPanel (AppState& state) : state_ (state)
+    {
+        styleLabel (heading_, "Speech material");
+        heading_.setFont (juce::FontOptions (15.0f, juce::Font::bold));
+        addAndMakeVisible (heading_);
+
+        styleLabel (explain_,
+                    "The rig fetches its own speech from LibriVox, which is public domain.");
+        addAndMakeVisible (explain_);
+
+        addAndMakeVisible (fetchButton_);
+        fetchButton_.setButtonText ("Start fetching");
+        fetchButton_.onClick = [this] { toggleFetching(); };
+
+        addAndMakeVisible (openLicenceButton_);
+        openLicenceButton_.setButtonText ("Open-licensed material only");
+        openLicenceButton_.setToggleState (state_.rig.speechPolicy.requireOpenLicence,
+                                           juce::dontSendNotification);
+        openLicenceButton_.onClick = [this]
+        {
+            state_.rig.speechPolicy.requireOpenLicence = openLicenceButton_.getToggleState();
+            state_.applySpeechSettings();
+            state_.refreshPlaylist();
+            state_.save();
+        };
+
+        styleLabel (cacheLabel_, "Cache limit (GB)");
+        addAndMakeVisible (cacheLabel_);
+        addAndMakeVisible (cacheEditor_);
+        cacheEditor_.setText (juce::String (state_.rig.speechPolicy.maxBytes
+                                            / (1024.0 * 1024.0 * 1024.0), 1),
+                              juce::dontSendNotification);
+        cacheEditor_.onTextChange = [this]
+        {
+            const double gb = juce::jlimit (0.5, 500.0, cacheEditor_.getText().getDoubleValue());
+            state_.rig.speechPolicy.maxBytes = static_cast<long long> (gb * 1024.0 * 1024.0 * 1024.0);
+            state_.applySpeechSettings();
+            state_.save();
+        };
+
+        styleLabel (bankedLabel_, "Hours needed before an unattended run");
+        addAndMakeVisible (bankedLabel_);
+        addAndMakeVisible (bankedEditor_);
+        bankedEditor_.setText (juce::String (state_.rig.speechPolicy.minBufferedSecondsForUnattended / 3600.0, 1),
+                               juce::dontSendNotification);
+        bankedEditor_.onTextChange = [this]
+        {
+            const double hours = juce::jlimit (0.1, 200.0, bankedEditor_.getText().getDoubleValue());
+            state_.rig.speechPolicy.minBufferedSecondsForUnattended = hours * 3600.0;
+            state_.applySpeechSettings();
+            state_.save();
+        };
+
+        addAndMakeVisible (progress_);
+
+        styleLabel (extraHeading_, "Additional material");
+        extraHeading_.setFont (juce::FontOptions (15.0f, juce::Font::bold));
+        addAndMakeVisible (extraHeading_);
+
+        addAndMakeVisible (folderButton_);
+        folderButton_.setButtonText (state_.rig.speechFolder.isEmpty()
+                                         ? "Add a local folder..."
+                                         : state_.rig.speechFolder);
+        folderButton_.onClick = [this] { chooseFolder(); };
+
+        addAndMakeVisible (clearFolderButton_);
+        clearFolderButton_.setButtonText ("Clear");
+        clearFolderButton_.onClick = [this]
+        {
+            state_.rig.speechFolder = {};
+            folderButton_.setButtonText ("Add a local folder...");
+            state_.refreshPlaylist();
+            state_.save();
+        };
+
+        styleLabel (feedLabel_, "Podcast / RSS feed URL");
+        addAndMakeVisible (feedLabel_);
+        addAndMakeVisible (feedEditor_);
+        addAndMakeVisible (addFeedButton_);
+        addFeedButton_.setButtonText ("Add feed");
+        addFeedButton_.onClick = [this] { addFeed(); };
+
+        makeLogBox (statusBox_);
+        addAndMakeVisible (statusBox_);
+
+        startTimerHz (2);
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced (12);
+
+        heading_.setBounds (area.removeFromTop (24));
+        explain_.setBounds (area.removeFromTop (22));
+        area.removeFromTop (6);
+
+        auto top = area.removeFromTop (32);
+        fetchButton_.setBounds (top.removeFromLeft (170));
+        top.removeFromLeft (12);
+        progress_.setBounds (top.removeFromLeft (280).reduced (0, 6));
+        area.removeFromTop (8);
+
+        openLicenceButton_.setBounds (area.removeFromTop (kRowHeight));
+        area.removeFromTop (6);
+
+        auto row = [&area] (juce::Label& l, juce::Component& c)
+        {
+            auto r = area.removeFromTop (kRowHeight);
+            l.setBounds (r.removeFromLeft (280));
+            c.setBounds (r.removeFromLeft (110));
+            area.removeFromTop (6);
+        };
+        row (cacheLabel_, cacheEditor_);
+        row (bankedLabel_, bankedEditor_);
+
+        area.removeFromTop (12);
+        extraHeading_.setBounds (area.removeFromTop (24));
+        area.removeFromTop (4);
+
+        auto folderRow = area.removeFromTop (kRowHeight);
+        clearFolderButton_.setBounds (folderRow.removeFromRight (80));
+        folderRow.removeFromRight (8);
+        folderButton_.setBounds (folderRow);
+        area.removeFromTop (6);
+
+        auto feedRow = area.removeFromTop (kRowHeight);
+        feedLabel_.setBounds (feedRow.removeFromLeft (200));
+        addFeedButton_.setBounds (feedRow.removeFromRight (100));
+        feedRow.removeFromRight (8);
+        feedEditor_.setBounds (feedRow);
+        area.removeFromTop (10);
+
+        statusBox_.setBounds (area);
+    }
+
+private:
+    void toggleFetching()
+    {
+        if (state_.speech.status().running)
+        {
+            state_.speech.stopFetching();
+            return;
+        }
+
+        state_.applySpeechSettings();
+        state_.speech.startFetching();
+    }
+
+    void chooseFolder()
+    {
+        chooser_ = std::make_unique<juce::FileChooser> ("Folder of speech recordings");
+        chooser_->launchAsync (juce::FileBrowserComponent::openMode
+                                   | juce::FileBrowserComponent::canSelectDirectories,
+                               [this] (const juce::FileChooser& fc)
+                               {
+                                   const auto folder = fc.getResult();
+                                   if (! folder.isDirectory())
+                                       return;
+
+                                   state_.rig.speechFolder = folder.getFullPathName();
+                                   folderButton_.setButtonText (state_.rig.speechFolder);
+                                   state_.refreshPlaylist();
+                                   state_.save();
+                               });
+    }
+
+    void addFeed()
+    {
+        const auto url = feedEditor_.getText().trim();
+        if (url.isEmpty())
+            return;
+
+        if (! isHttps (url.toStdString()))
+        {
+            statusBox_.setText ("Feeds must be https. A plaintext feed is refused because its "
+                                "contents get downloaded and decoded on this machine.", false);
+            return;
+        }
+
+        SpeechSource src;
+        src.enabled = true;
+        src.kind = SpeechSourceKind::podcastFeed;
+        src.name = hostOf (url.toStdString());
+        src.feedUrl = url;
+        // Anything from a feed is unknown-licence by definition. With the open
+        // licence requirement on - which is the default - it will be fetched and
+        // catalogued but never played, and the panel says so rather than leaving
+        // it looking as though the feed did nothing.
+        src.licence = LicenceClass::unknown;
+
+        state_.rig.speechSources.add (src);
+        state_.applySpeechSettings();
+        state_.save();
+        feedEditor_.clear();
+    }
+
+    void timerCallback() override
+    {
+        const auto s = state_.speech.status();
+
+        fetchButton_.setButtonText (s.running ? "Stop fetching" : "Start fetching");
+        progressValue_ = s.targetSeconds > 0.0
+                             ? juce::jlimit (0.0, 1.0, s.playableSeconds / s.targetSeconds)
+                             : 0.0;
+        progress_.setTextToDisplay (juce::String (s.playableSeconds / 3600.0, 1) + " h banked");
+
+        // The playlist only changes when the fetcher lands something, so rebuild
+        // it on a change in the item count rather than every tick.
+        if (s.itemCount != lastItemCount_)
+        {
+            lastItemCount_ = s.itemCount;
+            state_.refreshPlaylist();
+        }
+
+        // Record what is actually being played, which is what the eviction order
+        // is built from.
+        const auto playing = state_.audio.currentSpeechPath();
+        if (playing != lastPlayed_ && playing.existsAsFile())
+        {
+            lastPlayed_ = playing;
+            state_.speech.notePlayed (playing);
+        }
+
+        const auto manifest = state_.speech.manifest();
+        int pd = 0, attribution = 0, unknown = 0;
+        for (const auto& i : manifest.items())
+        {
+            switch (i.licence)
+            {
+                case LicenceClass::publicDomain:          ++pd; break;
+                case LicenceClass::permissiveAttribution: ++attribution; break;
+                case LicenceClass::unknown:               ++unknown; break;
+            }
+        }
+
+        juce::StringArray lines;
+        lines.add (s.step.isNotEmpty() ? s.step : juce::String ("Idle."));
+        lines.add ("");
+        lines.add ("Banked and playable: " + juce::String (s.playableSeconds / 3600.0, 2)
+                   + " h of " + juce::String (s.targetSeconds / 3600.0, 1) + " h target");
+        lines.add ("Cache:               " + juce::String (s.cacheBytes / (1024.0 * 1024.0 * 1024.0), 2)
+                   + " GB of " + juce::String (state_.rig.speechPolicy.maxBytes / (1024.0 * 1024.0 * 1024.0), 1)
+                   + " GB, " + juce::String (s.itemCount) + " files");
+        lines.add ("Fetched this session: " + juce::String (s.downloadedThisSession)
+                   + " kept, " + juce::String (s.rejectedThisSession) + " rejected");
+        lines.add ("");
+        lines.add ("Licences:  public domain " + juce::String (pd)
+                   + "   attribution " + juce::String (attribution)
+                   + "   unknown " + juce::String (unknown));
+
+        if (unknown > 0 && state_.rig.speechPolicy.requireOpenLicence)
+            lines.add ("           " + juce::String (unknown)
+                       + " unknown-licence files are cached but will not be played,");
+        if (unknown > 0 && state_.rig.speechPolicy.requireOpenLicence)
+            lines.add ("           because \"open-licensed material only\" is on.");
+
+        lines.add ("");
+        lines.add (s.readyForUnattended
+                       ? "Enough banked for an unattended run."
+                       : "Not enough banked for an unattended run yet.");
+
+        if (s.lastError.isNotEmpty())
+        {
+            lines.add ("");
+            lines.add ("Last problem: " + s.lastError);
+        }
+
+        lines.add ("");
+        lines.add ("Note: LibriVox is read speech. It does not contain the material that most");
+        lines.add ("often causes a false detection - sustained vowels and sung notes with vibrato.");
+        lines.add ("Record those yourself and add them as a local folder.");
+
+        statusBox_.setText (lines.joinIntoString ("\n"), false);
+    }
+
+    AppState& state_;
+    juce::Label heading_, explain_, cacheLabel_, bankedLabel_, extraHeading_, feedLabel_;
+    juce::TextEditor cacheEditor_, bankedEditor_, feedEditor_;
+    juce::TextButton fetchButton_, folderButton_, clearFolderButton_, addFeedButton_;
+    juce::ToggleButton openLicenceButton_;
+    double progressValue_ { 0.0 };
+    juce::ProgressBar progress_ { progressValue_ };
+    juce::TextEditor statusBox_;
+    std::unique_ptr<juce::FileChooser> chooser_;
+    int lastItemCount_ { -1 };
+    juce::File lastPlayed_;
 };
 
 // ===========================================================================
@@ -628,6 +920,16 @@ private:
         if (! state_.rig.selfTestPassed)
             out.add ("- The routing self test has not passed for this wiring. Run it on the Check panel.");
 
+        // A run with nothing to say measures nothing. Gated on hours banked
+        // rather than on the network being up, because the network going away
+        // mid-run is survivable and starting with an empty cache is not.
+        const auto speech = state_.speech.status();
+        if (! speech.readyForUnattended)
+            out.add ("- Only " + juce::String (speech.playableSeconds / 3600.0, 1)
+                     + " h of speech is banked, and this rig wants "
+                     + juce::String (state_.rig.speechPolicy.minBufferedSecondsForUnattended / 3600.0, 1)
+                     + " h before an unattended run. Fetch more on the Speech panel.");
+
         return out;
     }
 
@@ -725,13 +1027,24 @@ MainComponent::MainComponent()
     if (state_.rig.addresses.valid)
         state_.console.setResolved (state_.rig.addresses);
 
-    if (state_.rig.speechFolder.isNotEmpty())
-        state_.audio.setSpeechFolder (juce::File (state_.rig.speechFolder));
+    if (state_.rig.speechSources.isEmpty())
+        state_.rig.speechSources = defaultSpeechSources();
+    if (state_.rig.speechCacheFolder.isEmpty())
+        state_.rig.speechCacheFolder = defaultSpeechCacheFolder().getFullPathName();
+
+    state_.applySpeechSettings();
+    state_.speech.loadLibrary();
+    state_.refreshPlaylist();
+
+    // A landed download makes the playlist stale, so rebuild it when the fetcher
+    // says so rather than polling the disk.
+    state_.speech.onLibraryChanged = [this] { state_.refreshPlaylist(); };
 
     const auto background = juce::Colours::darkgrey.darker (0.6f);
     addAndMakeVisible (tabs_);
     tabs_.addTab ("Rig", background, new RigPanel (state_), true);
     tabs_.addTab ("Console", background, new ConsolePanel (state_), true);
+    tabs_.addTab ("Speech", background, new SpeechPanel (state_), true);
     tabs_.addTab ("Check", background, new CheckPanel (state_), true);
     tabs_.addTab ("Run", background, new RunPanel (state_), true);
 
@@ -742,6 +1055,9 @@ MainComponent::~MainComponent()
 {
     if (state_.run != nullptr)
         state_.run->stop();
+    state_.speech.onLibraryChanged = nullptr;
+    state_.speech.stopFetching();
+    state_.speech.saveLibrary();
     state_.audio.stop();
     state_.save();
 }

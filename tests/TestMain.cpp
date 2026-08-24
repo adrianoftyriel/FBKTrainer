@@ -15,11 +15,13 @@
 #include "GainRamp.h"
 #include "RigConfig.h"
 #include "RoutingCheck.h"
+#include "SpeechCatalogue.h"
 #include "SafetySupervisor.h"
 #include "Units.h"
 #include "WingProtocol.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <vector>
 
 using namespace fbkt;
@@ -896,6 +898,296 @@ void testRoutingCheck()
 }
 
 // ---------------------------------------------------------------------------
+void testSpeechCatalogue()
+{
+    test::beginTest ("SpeechCatalogue - host extraction resists disguised URLs");
+
+    CHECK (hostOf ("https://archive.org/download/x/y.mp3") == "archive.org");
+    CHECK (hostOf ("https://ia800207.us.archive.org/12/items/x/y.ogg") == "ia800207.us.archive.org");
+    CHECK (hostOf ("https://ARCHIVE.ORG/x") == "archive.org");
+    CHECK (hostOf ("https://archive.org:443/x") == "archive.org");
+    CHECK (hostOf ("not a url").empty());
+
+    // The classic disguise: userinfo before the real host. Naive parsing reads
+    // this as archive.org, which is exactly how an allowlist gets walked past.
+    CHECK (hostOf ("https://archive.org@evil.example/x") == "evil.example");
+    CHECK (! isArchiveHost ("https://archive.org@evil.example/x"));
+    CHECK (! isArchiveHost ("https://archive.org.evil.example/x"));
+    CHECK (! isArchiveHost ("https://notarchive.org/x"));
+
+    test::beginTest ("SpeechCatalogue - the built-in source is locked to HTTPS on Archive hosts");
+
+    CHECK (isArchiveHost ("https://archive.org/download/x/y.ogg"));
+    CHECK (isArchiveHost ("https://ia903103.us.archive.org/9/items/x/y.flac"));
+    CHECK (isArchiveHost ("https://librivox.org/api/feed/audiobooks"));
+    // Plaintext is refused even on the right host: a redirect to http is a
+    // downgrade, and we are downloading files we will decode.
+    CHECK (! isArchiveHost ("http://archive.org/download/x/y.ogg"));
+    CHECK (! isHttps ("http://archive.org/x"));
+    CHECK (isHttps ("https://archive.org/x"));
+
+    test::beginTest ("SpeechCatalogue - derivative preference");
+
+    // FLAC and Ogg beat any MP3; among MP3s, the higher rate wins.
+    CHECK_LT (archiveFormatPreference ("Flac"), archiveFormatPreference ("Ogg Vorbis"));
+    CHECK_LT (archiveFormatPreference ("Ogg Vorbis"), archiveFormatPreference ("128Kbps MP3"));
+    CHECK_LT (archiveFormatPreference ("128Kbps MP3"), archiveFormatPreference ("64Kbps MP3"));
+    CHECK_LT (archiveFormatPreference ("VBR MP3"), archiveFormatPreference ("64Kbps MP3"));
+
+    // Everything the Archive also stores alongside the audio must be rejected,
+    // or the fetcher downloads cover art and calls it speech.
+    CHECK (archiveFormatPreference ("JPEG") < 0);
+    CHECK (archiveFormatPreference ("Metadata") < 0);
+    CHECK (archiveFormatPreference ("Text") < 0);
+    CHECK (archiveFormatPreference ("") < 0);
+
+    test::beginTest ("SpeechCatalogue - choosing a derivative from a real item layout");
+
+    CachePolicy sel;
+
+    // What an Archive LibriVox item actually looks like: several audio
+    // derivatives plus cover art, metadata and the Archive's own bookkeeping.
+    const std::vector<ArchiveFile> item = {
+        { "chapter01.mp3",            "VBR MP3",       9'400'000, 1234.0 },
+        { "chapter01_64kb.mp3",       "64Kbps MP3",    4'900'000, 1234.0 },
+        { "chapter01_128kb.mp3",      "128Kbps MP3",   9'800'000, 1234.0 },
+        { "chapter01.ogg",            "Ogg Vorbis",    7'100'000, 1234.0 },
+        { "cover.jpg",                "JPEG",             84'000, 0.0 },
+        { "book_meta.xml",            "Metadata",          3'400, 0.0 },
+        { "book_files.xml",           "Metadata",          8'100, 0.0 },
+        { "__ia_thumb.jpg",           "Item Tile",        12'000, 0.0 },
+    };
+
+    const int pick = chooseBestDerivative (item, sel);
+    CHECK (pick >= 0);
+    CHECK (item[static_cast<size_t> (pick)].name == "chapter01.ogg");   // Ogg beats every MP3
+
+    // With no Ogg present, the best MP3 wins rather than the first one listed.
+    std::vector<ArchiveFile> mp3Only;
+    for (const auto& f : item)
+        if (f.format.find ("Ogg") == std::string::npos)
+            mp3Only.push_back (f);
+
+    const int mp3Pick = chooseBestDerivative (mp3Only, sel);
+   #if defined(__linux__) && ! defined(FBKT_HAVE_MP3)
+    // No MP3 decoder on this platform, so an item with only MP3 derivatives is
+    // correctly skipped rather than downloaded and then found unplayable.
+    CHECK (mp3Pick < 0);
+   #else
+    CHECK (mp3Pick >= 0);
+    CHECK (mp3Only[static_cast<size_t> (mp3Pick)].format == "VBR MP3");
+   #endif
+
+    test::beginTest ("SpeechCatalogue - an item with nothing usable is refused");
+
+    CHECK (chooseBestDerivative ({}, sel) < 0);
+    CHECK (chooseBestDerivative ({ { "cover.jpg", "JPEG", 84'000, 0.0 },
+                                   { "meta.xml", "Metadata", 3'400, 0.0 } }, sel) < 0);
+
+    // The format field and the extension have to agree. An entry naming an audio
+    // format on a file that is plainly not audio is a trap that a format-only
+    // check walks straight into.
+    CHECK (chooseBestDerivative ({ { "cover.jpg", "Ogg Vorbis", 900'000, 10.0 } }, sel) < 0);
+    CHECK (chooseBestDerivative ({ { "chapter.ogg", "JPEG", 900'000, 10.0 } }, sel) < 0);
+
+    test::beginTest ("SpeechCatalogue - absurd sizes are refused");
+
+    // An error page saved as audio.
+    CHECK (chooseBestDerivative ({ { "chapter.ogg", "Ogg Vorbis", 2'000, 10.0 } }, sel) < 0);
+    // A whole unsplit audiobook.
+    CHECK (chooseBestDerivative ({ { "whole.ogg", "Ogg Vorbis", 3'000'000'000LL, 40000.0 } }, sel) < 0);
+    // And the one in between is fine.
+    CHECK (chooseBestDerivative ({ { "chapter.ogg", "Ogg Vorbis", 7'000'000, 1200.0 } }, sel) >= 0);
+
+    test::beginTest ("SpeechCatalogue - download URLs survive awkward filenames");
+
+    // Archive filenames routinely carry spaces and apostrophes. A URL built by
+    // concatenation 404s for exactly those, which would quietly narrow the
+    // corpus to the files with tidy names.
+    CHECK (archiveDownloadUrl ("mybook_1234", "chapter01.ogg")
+           == "https://archive.org/download/mybook_1234/chapter01.ogg");
+    CHECK (archiveDownloadUrl ("b", "a file.ogg")
+           == "https://archive.org/download/b/a%20file.ogg");
+    CHECK (archiveDownloadUrl ("b", "o'brien.mp3")
+           == "https://archive.org/download/b/o%27brien.mp3");
+    CHECK (archiveDownloadUrl ("b", "caf\xc3\xa9.ogg")
+           == "https://archive.org/download/b/caf%C3%A9.ogg");
+
+    // A path separator in a name must not escape the item directory.
+    CHECK (archiveDownloadUrl ("b", "../../etc/passwd")
+           == "https://archive.org/download/b/..%2F..%2Fetc%2Fpasswd");
+
+    test::beginTest ("SpeechCatalogue - a remote name cannot become a local path");
+
+    // Only the extension of a remote name reaches the filesystem, because cached
+    // files are named after their id hash. That is still enough to matter: an
+    // extension containing a separator turns a filename into a path.
+    CHECK (safeExtensionFor ("chapter01.ogg") == ".ogg");
+    CHECK (safeExtensionFor ("Chapter01.OGG") == ".ogg");
+    CHECK (safeExtensionFor ("a.flac") == ".flac");
+    CHECK (safeExtensionFor ("a.o/b") == ".audio");          // would have been ".o/b"
+    CHECK (safeExtensionFor ("a.ogg/../../evil") == ".audio");
+    CHECK (safeExtensionFor ("noextension") == ".audio");
+    CHECK (safeExtensionFor ("trailingdot.") == ".audio");
+    CHECK (safeExtensionFor (".ogg") == ".ogg");             // a bare extension is still one
+    CHECK (safeExtensionFor (".hidden") == ".audio");        // six characters: past the limit
+    CHECK (safeExtensionFor ("a.verylongextension") == ".audio");
+    CHECK (safeExtensionFor ("a.o g") == ".audio");
+    CHECK (safeExtensionFor ("") == ".audio");
+
+    CHECK (archiveDownloadUrl ("", "x.ogg").empty());
+    CHECK (archiveDownloadUrl ("b", "").empty());
+
+    // And whatever it builds must still satisfy the host lock.
+    CHECK (isArchiveHost (archiveDownloadUrl ("mybook", "ch01.ogg")));
+
+    test::beginTest ("SpeechCatalogue - duration parsing, or zero rather than a guess");
+
+    CHECK_CLOSE (parseArchiveLength ("1234.56"), 1234.56, 1e-6);
+    CHECK_CLOSE (parseArchiveLength ("20:34"), 1234.0, 1e-6);
+    CHECK_CLOSE (parseArchiveLength ("1:20:34"), 4834.0, 1e-6);
+    CHECK_CLOSE (parseArchiveLength ("0:07"), 7.0, 1e-6);
+
+    // A wrong duration would corrupt the buffered-hours figure that decides
+    // whether an unattended run may start, so anything unparseable is zero.
+    CHECK_CLOSE (parseArchiveLength (""), 0.0, 1e-9);
+    CHECK_CLOSE (parseArchiveLength ("unknown"), 0.0, 1e-9);
+    CHECK_CLOSE (parseArchiveLength ("12:"), 0.0, 1e-9);
+    CHECK_CLOSE (parseArchiveLength ("-5"), 0.0, 1e-9);
+
+    test::beginTest ("SpeechCatalogue - ids are stable and distinct");
+
+    const auto a = itemIdForUrl ("https://archive.org/download/book/ch01.ogg");
+    const auto b = itemIdForUrl ("https://archive.org/download/book/ch02.ogg");
+    CHECK (a == itemIdForUrl ("https://archive.org/download/book/ch01.ogg"));
+    CHECK (a != b);
+    CHECK (a.size() == 16);
+
+    test::beginTest ("SpeechCatalogue - unknown-licence material is excluded by default");
+
+    auto makeItem = [] (const char* id, LicenceClass licence, long long bytes,
+                        double seconds, long long lastPlayed)
+    {
+        SpeechItem i;
+        i.id = id;
+        i.licence = licence;
+        i.bytes = bytes;
+        i.seconds = seconds;
+        i.lastPlayedUnix = lastPlayed;
+        return i;
+    };
+
+    SpeechManifest m;
+    CHECK (m.add (makeItem ("aa", LicenceClass::publicDomain, 1000, 600.0, 0)));
+    CHECK (m.add (makeItem ("bb", LicenceClass::permissiveAttribution, 2000, 600.0, 0)));
+    CHECK (m.add (makeItem ("cc", LicenceClass::unknown, 4000, 600.0, 0)));
+    CHECK (! m.add (makeItem ("aa", LicenceClass::publicDomain, 1, 1.0, 0)));   // duplicate
+
+    CachePolicy strict;
+    strict.requireOpenLicence = true;
+    CHECK (m.playable (strict).size() == 2);
+    CHECK_CLOSE (m.playableSeconds (strict), 1200.0, 1e-6);
+
+    CachePolicy loose;
+    loose.requireOpenLicence = false;
+    CHECK (m.playable (loose).size() == 3);
+    CHECK_CLOSE (m.playableSeconds (loose), 1800.0, 1e-6);
+
+    // Total bytes counts everything on disk regardless of licence - the file is
+    // occupying the disk whether or not we are allowed to play it.
+    CHECK (m.totalBytes() == 7000);
+
+    test::beginTest ("SpeechCatalogue - unattended readiness");
+
+    CachePolicy policy;
+    policy.minBufferedSecondsForUnattended = 3600.0;
+    CHECK (! m.readyForUnattendedRun (policy));
+
+    SpeechManifest big;
+    for (int i = 0; i < 10; ++i)
+    {
+        char id[8];
+        std::snprintf (id, sizeof (id), "i%02d", i);
+        big.add (makeItem (id, LicenceClass::publicDomain, 1000, 400.0, 0));
+    }
+    CHECK (big.readyForUnattendedRun (policy));          // 4000 s > 3600 s
+
+    // Unknown-licence material does not count towards readiness while the open
+    // licence requirement is on, so a cache full of podcasts cannot let a
+    // distribution run start.
+    SpeechManifest podcasts;
+    for (int i = 0; i < 10; ++i)
+    {
+        char id[8];
+        std::snprintf (id, sizeof (id), "p%02d", i);
+        podcasts.add (makeItem (id, LicenceClass::unknown, 1000, 400.0, 0));
+    }
+    CHECK (! podcasts.readyForUnattendedRun (policy));
+    CachePolicy permissive = policy;
+    permissive.requireOpenLicence = false;
+    CHECK (podcasts.readyForUnattendedRun (permissive));
+
+    test::beginTest ("SpeechCatalogue - eviction takes the least recently played first");
+
+    SpeechManifest cache;
+    cache.add (makeItem ("old",    LicenceClass::publicDomain, 1000, 100.0, 1000));
+    cache.add (makeItem ("newer",  LicenceClass::publicDomain, 1000, 100.0, 5000));
+    cache.add (makeItem ("newest", LicenceClass::publicDomain, 1000, 100.0, 9000));
+    cache.add (makeItem ("unused", LicenceClass::publicDomain, 1000, 100.0, 0));
+
+    auto evict = cache.selectForEviction (1500);
+    CHECK (evict.size() == 2);
+    CHECK (evict[0] == "old");
+    CHECK (evict[1] == "newer");
+
+    // Never-played material is evicted last. It is the only part of the cache
+    // that still has something to contribute; discarding it to keep something
+    // already used would narrow the corpus every time the disk filled.
+    auto evictAll = cache.selectForEviction (100000);
+    CHECK (evictAll.size() == 4);
+    CHECK (evictAll.back() == "unused");
+
+    test::beginTest ("SpeechCatalogue - what is playing is never evicted");
+
+    auto protectedEvict = cache.selectForEviction (1500, { "old", "newer" });
+    CHECK (! protectedEvict.empty());
+    for (const auto& id : protectedEvict)
+    {
+        CHECK (id != "old");
+        CHECK (id != "newer");
+    }
+
+    CHECK (cache.selectForEviction (0).empty());
+    CHECK (cache.selectForEviction (-5).empty());
+
+    test::beginTest ("SpeechCatalogue - headroom and play accounting");
+
+    CachePolicy small;
+    small.maxBytes = 4500;
+    CHECK (cache.headroomBytes (small) == 500);
+    small.maxBytes = 1000;
+    CHECK (cache.headroomBytes (small) == 0);          // never negative
+
+    // Playing it stamps it, which moves it out of the never-played group and
+    // into the ordinary least-recently-played ordering at that timestamp.
+    cache.notePlayed ("unused", 3000);
+    const auto* played = cache.find ("unused");
+    CHECK (played != nullptr && played->lastPlayedUnix == 3000);
+    CHECK (played != nullptr && played->timesPlayed == 1);
+
+    const auto afterPlaying = cache.selectForEviction (100000);
+    CHECK (afterPlaying.size() == 4);
+    CHECK (afterPlaying[0] == "old");        // 1000
+    CHECK (afterPlaying[1] == "unused");     // 3000, no longer protected by being fresh
+    CHECK (afterPlaying[2] == "newer");      // 5000
+    CHECK (afterPlaying[3] == "newest");     // 9000
+
+    CHECK (cache.remove ("old"));
+    CHECK (! cache.remove ("old"));
+    CHECK (cache.find ("old") == nullptr);
+}
+
+// ---------------------------------------------------------------------------
 int main()
 {
     testUnits();
@@ -910,5 +1202,6 @@ int main()
     testSupervisorGovernor();
     testSupervisorBurstAndThermal();
     testRoutingCheck();
+    testSpeechCatalogue();
     return test::summary();
 }
